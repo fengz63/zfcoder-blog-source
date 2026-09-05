@@ -9,13 +9,13 @@ categories: [技术]
 
 ## 1. 背景
 
-Kubernetes 中所有的API对象都是存储在Etcd中，且只能通过kube-apiserver访问。当访问量很大时，kube-apiserver会不堪重负。
+Kubernetes 中所有的API对象都是存储在Etcd中，且只能通过kube-apiserver访问，当访问量很大时，kube-apiserver会不堪重负。
 
-基于上述考虑，kubernetes 中引入了一个informer机制，本质上是在内存中维护一个缓存，客户端的读写请求都可以通过缓存实现，而不必全部穿透到kube-apiserver。
+基于上述考虑，kubernetes 中引入了一个informer机制。informer 会在客户端内维护一份资源缓存，控制器可以通过 lister/indexer 读取缓存，避免频繁访问kube-apiserver。此外，创建、更新和删除等写操作仍需要通过 kube-apiserver 执行。
 
 <!--more-->
 
-Kubernetes实现这一缓存的核心就是 list 和 watch 操作。本文基于 Kubernetes 源码（路径：`staging/src/k8s.io/client-go/tools/cache/`），深入剖析list & watch机制以及承载变更数据的 DeltaFIFO。
+Kubernetes实现这一缓存的核心就是 list 和 watch 操作。本文基于 Kubernetes 源码（`staging/src/k8s.io/client-go/tools/cache/`），深入剖析list & watch机制以及承载变更数据的 DeltaFIFO。大致过程可以概括为：Reflector 将 API Server 返回的对象和事件转换为 Delta，并写入 DeltaFIFO；Informer Controller 再从 DeltaFIFO 中取出 Delta，更新 Indexer，并通知事件处理器。
 
 ## 2. ListerWatcher
 
@@ -108,11 +108,15 @@ type Store interface {
 }
 ```
 
-`ReflectorStore`（`reflector.go:71`）是 Reflector 使用的 Store 子集，只包含 Add/Update/Delete/Replace/Resync 五个方法。具体的实现 `cache` 结构体（`store.go:204`）包装了 `ThreadSafeStore`，而 `ThreadSafeStore` 的底层是 `threadSafeMap`（`thread_safe_store.go:256`），通过 `sync.RWMutex` 保证并发安全，键由 `KeyFunc`（默认 `MetaNamespaceKeyFunc`，生成 `<namespace>/<name>`）生成。
+`ReflectorStore`（`reflector.go:71`）是 Reflector 使用的 Store 子集，只包含 Add/Update/Delete/Replace/Resync 五个方法。Reflector 并不直接维护最终的本地缓存，而是把事件写入这个接口；在 Informer 中，ReflectorStore 通常是 DeltaFIFO。
+
+最终用于查询的本地缓存通常是 Indexer。具体实现中，`cache` 结构体（`store.go:204`）使用 `ThreadSafeStore` 作为底层存储，而 `ThreadSafeStore` 的底层是 `threadSafeMap`（`thread_safe_store.go:256`），通过 `sync.RWMutex` 保证并发安全，键由 `KeyFunc`（默认 `MetaNamespaceKeyFunc`，对命名空间对象生成 `<namespace>/<name>`）生成。
 
 ## 4. DeltaFIFO
 
-`DeltaFIFO`（`delta_fifo.go:108`）是 producer-consumer 队列，**Reflector 是生产者**，**Controller 是消费者**。它的核心设计是：每个对象的累加器不是单一的最新对象，而是一个 `Deltas`（`delta_fifo.go:223`）—— 即 `Delta` 的切片，记录了该对象发生的所有变更。
+`DeltaFIFO`（`delta_fifo.go:108`）为每个对象维护一个按 key 索引的待处理变更列表，而不是只保存对象的最新状态。这个列表类型就是 `Deltas`，本质上是多个 `Delta` 的切片。同一个 key 在 FIFO 队列中只出现一次，但该 key 对应的 `Deltas` 可以累积多条变更。
+
+FIFO 只对部分重复事件进行去重，目前主要是合并相邻的重复删除事件，并不会把多个更新事件统一压缩为最新对象。
 
 ### 4.1 数据结构
 
@@ -121,11 +125,11 @@ type Store interface {
 type DeltaFIFO struct {
 	lock       sync.RWMutex
 	cond       sync.Cond
-	items      map[string]Deltas   // key -> 该对象的所有增量
+	items      map[string]Deltas   // key -> 该对象的待处理变更
 	queue      []string            // FIFO 顺序的 key 列表
 	synced     chan struct{}       // 初始同步完成后关闭
 	populated  bool                // 是否有过数据写入
-	initialPopulationCount int     // 首次Replace写入的对象数
+	initialPopulationCount int     // 首次Replace写入的对象和删除事件数
 	keyFunc    KeyFunc
 	knownObjects KeyListerGetter   // 用于检测删除（在Informer中就是indexer）
 	emitDeltaTypeReplaced bool
@@ -133,7 +137,7 @@ type DeltaFIFO struct {
 }
 ```
 
-双结构设计：`items` 是 map 负责快速查找，`queue` 是 slice 维持 FIFO 顺序。两者通过 key 关联，一个 key 在 `items` 中当且仅当在 `queue` 中。
+双结构设计：`items` 是 map，负责按 key 保存待处理的 `Deltas`；`queue` 是 slice，负责维持 key 的 FIFO 顺序。两者通过 key 关联：一个 key 在 `items` 中当且仅当它在 `queue` 中。需要注意，`queue` 去重的是 key，不是 Delta；同一个 key 的多次变更会追加到对应的 `Deltas` 中。
 
 ### 4.2 Delta 类型
 
@@ -184,12 +188,21 @@ func (f *DeltaFIFO) queueActionInternalLocked(actionType, internalActionType Del
 
 **Replace**（`delta_fifo.go:619`）：
 
-当执行全量 relist 时调用，这是 DeltaFIFO 中最复杂的方法：
+Replace 用于处理 Reflector 的全量 List 结果。它不会直接修改最终缓存，而是在 DeltaFIFO 内部执行一次带删除检测的批量入队，流程大致如下：
+- 为 List 返回的每个对象生成 Sync 或 Replaced Delta；
+- 检查 FIFO 中已有但本次 List 未返回的对象，为其生成删除 Delta；
+- 检查 knownObjects 中已经处理过、但本次 List 未返回的对象，补生成删除 tombstone；
+- 第一次 Replace 时记录初始对象数量，用于判断初始同步是否完成。
+
+因此，Replace 既负责把全量 List 结果转换成待处理事件，也负责补偿 Watch 断连期间丢失的删除事件。
 
 ```go
 // delta_fifo.go:619
+// 以下代码省略了错误处理和部分局部变量，仅展示核心流程
 func (f *DeltaFIFO) Replace(list []interface{}, _ string) error {
-	// 1. 对每个新对象生成 Replaced/Sync 类型的 Delta
+	// 1. 为本次 list 返回的对象生成 Delta，默认情况下，这些 Delta 的 action 是 Sync；如果启用
+	// 了 EmitDeltaTypeReplaced，则使用 Replaced。
+	// 这里的 Sync 表示这次全量 list 证明对象当前仍然存在，需要把它重新交给消费者处理。
 	for _, item := range list {
 		f.queueActionInternalLocked(action, Replaced, item)
 	}
@@ -209,7 +222,18 @@ func (f *DeltaFIFO) Replace(list []interface{}, _ string) error {
 }
 ```
 
-Replace 的删除检测机制非常重要：当 Reflector 断连后重新 List，期间发生的删除事件可能丢失。通过比对全量 List 结果与本地缓存的差异，Replace 能"补偿"丢失的删除事件，将缺失的对象包装为 `DeletedFinalStateUnknown` 作为 tombstone。
+例如，第一次 List 返回对象 A、B，Controller 处理完成后，A、B 已经存在于 Indexer 中。之后 Reflector 与 API Server 断连，B 被删除，但删除事件没有被 Watch 收到。重新 List 只返回 A 时，B 已经不在 `f.items` 中，而是在 `knownObjects`（Informer 中通常就是 Indexer）中。Replace 会发现 B 不在新列表中，于是生成：
+
+```go
+DeletedFinalStateUnknown{
+    Key: "B",
+    Obj: lastKnownObjectOfB,
+}
+```
+
+这个对象称为 tombstone，随后由 Controller 消费并从 Indexer 中删除。Replace 的删除检测机制因此可以补偿 Reflector 断连期间丢失的删除事件。
+
+第一次执行 Replace 时，`initialPopulationCount` 会记录初始 List 对象以及初始删除事件的数量。Controller 每次 Pop 一个对象后，该计数递减；计数归零后，DeltaFIFO 关闭 `synced` 通道，表示初始数据已经处理完成。
 
 **Pop**（`delta_fifo.go:562`）：
 
@@ -234,7 +258,7 @@ func (f *DeltaFIFO) Pop(process PopProcessFunc) (interface{}, error) {
 }
 ```
 
-`Pop` 在加锁状态下调用 process 函数，确保队列操作与消费者处理的原子性。当 `populated && initialPopulationCount == 0` 时，`f.synced` 通道关闭，标识初始同步完成。
+`Pop` 在持有 FIFO 锁的状态下调用 `process` 函数，因此 `process` 可以与队列状态保持同步；但这也意味着 `process` 不应该执行耗时的 I/O，否则会阻塞生产者的 Add/Update/Delete。处理失败时，调用方通常需要通过 `AddIfNotPresent` 将对象重新放回队列。当 `populated && initialPopulationCount == 0` 时，`f.synced` 通道关闭，标识初始同步完成。
 
 ## 5. Reflector
 
@@ -291,7 +315,7 @@ func (r *Reflector) ListAndWatchWithContext(ctx context.Context) error {
 
 ### 5.3 list() — 全量拉取
 
-`list()`（`reflector.go:674`）通过分页（pager）从 API Server 拉取全量对象。关键流程：
+`list()`（`reflector.go:674`）通过分页（pager）从 kube-apiserver 拉取全量对象。关键流程：
 
 1. 通过 `relistResourceVersion()`（`reflector.go:1116`）确定 ResourceVersion：
    - 首次调用返回 `"0"`（从 watch cache 读取）
@@ -327,7 +351,7 @@ func (r *Reflector) list(ctx context.Context) error {
 }
 ```
 
-分页逻辑的关键在于：当 `ResourceVersion != "" && != "0"` 时关闭分页，强制从 watch cache 读取，避免对 etcd 的 thundering herd 问题。
+分页逻辑的关键在于：当 resourceVersion 非空且不为"0"时，reflector 通常会关闭分页，以便在 apiserver 启用 watch cache 时优先从 watch cache 获取数据，从而减少对 etcd 的集中读取压力。
 
 ### 5.4 watch() — 增量监听
 
@@ -354,7 +378,7 @@ func (r *Reflector) watch(ctx context.Context, w watch.Interface, resyncerrc cha
 ```
 
 关键设计：
-- `AllowWatchBookmarks: true`：开启 bookmark 机制，服务器定期推送 ResourceVersion，避免因无事件导致长连接超时
+- `AllowWatchBookmarks: true`：bookmark 是一种不携带资源对象的 resourceVersion 进度通知。reflector 收到 Bookmark 后可以推进已观察到的 resourceVersion，从而在 watch 重建时降低重复处理或从过旧版本恢复的风险。
 - `TimeoutSeconds` 随机在 `[5min, 10min]` 范围内，避免所有 watcher 同时超时重建
 - 410 Expired 错误 → 回到外层重新 `list()`；429 TooManyRequests → backoff 后继续；InternalError → 有限次重试
 
@@ -362,32 +386,9 @@ backoff 参数（`reflector.go:62`）：
 - 初始间隔 800ms，最大间隔 30s
 - 2 分钟无错后重置，乘数 2.0，抖动 1.0
 
-### 5.5 handleAnyWatch() — 事件处理
+### 5.5 WatchList 流模式（KEP-3157）
 
-`handleAnyWatch()`（`reflector.go:972`）处理 watch 通道的事件并写入 store：
-
-```go
-// reflector.go:1037
-switch event.Type {
-case watch.Added:
-	store.Add(event.Object)
-case watch.Modified:
-	store.Update(event.Object)
-case watch.Deleted:
-	store.Delete(event.Object)
-case watch.Bookmark:
-	if meta.GetAnnotations()["k8s.io/initial-events-end"] == "true" {
-		watchListBookmarkReceived = true   // WatchList 结束标记
-	}
-	if bookmarkStore, ok := store.(ReflectorBookmarkStore); ok {
-		bookmarkStore.Bookmark(resourceVersion)
-	}
-}
-```
-
-### 5.6 WatchList 流模式（KEP-3157）
-
-WatchList（`reflector.go:804`）是 Kubernetes 1.31+ 引入的新特性，通过一次流式连接完成全量同步 + 增量监听：
+WatchList（`reflector.go:804`）通过一次流式 Watch 完成初始状态同步和后续增量监听。初始阶段，apierver 基于 watch cache 获取符合条件对象在目标 ResourceVersion 上的最新状态快照，并将快照中的每个对象转换为合成的 `Added` 事件发送给客户端。
 
 ```go
 // reflector.go:854
@@ -401,23 +402,24 @@ options := metav1.ListOptions{
 w, err = r.listerWatcher.WatchWithContext(ctx, options)
 ```
 
-流程：
-1. 建立 watch 流，设置 `SendInitialEvents: true` 和 `ResourceVersionMatchNotOlderThan`
-2. 服务器依次发送所有对象的 `Added` 事件（合成事件）
-3. 服务器发送带 `k8s.io/initial-events-end` 注解的 `Bookmark` 事件，标识初始快照完成
-4. Reflector 调用 `r.store.Replace(temporaryStore.List(), resourceVersion)` 替换存储
-5. **复用同一 watch 流** 继续接收后续增量（`stopWatcher = false` 避免关闭连接）
+初始对象发送完成后，服务端发送带有 `k8s.io/initial-events-end: "true"` 注解的 `Bookmark`，表示初始状态已经同步完成；之后同一条 Watch 流继续发送后续的 `Added`、`Modified`、`Deleted` 和 `Bookmark` 事件。客户端最终看到的事件顺序可以概括为：
+```text
+watch cache 当前对象快照
+    → 合成 Added 事件
+    → initial-events-end Bookmark
+    → 实时增量事件
+```
 
 与传统模式对比：
 
 | 特性 | 传统模式 (list+watch) | WatchList 流模式 |
 |------|----------------------|-----------------|
 | 全量同步 | 分页 GET 请求，可能请求 etcd | 流式 Watch，常驻 watch cache |
-| 一致性 | 分页请求非原子，可能看到中间态 | 单流原子快照，一致性保证 |
+| 一致性 | 分页会增加请求次数和处理链路复杂度 | 单流原子快照，一致性保证 |
 | 服务器开销 | 大量 GET + 分页对 etcd 的压力 | 单一长连接，资源消耗小 |
 | 启用条件 | 默认行为 | `WatchListClient` 特性门控 + API Server 支持 |
 
-### 5.7 运行循环
+### 5.6 运行循环
 
 `RunWithContext()`（`reflector.go:416`）是外层循环，持续调用 `ListAndWatchWithContext`：
 
@@ -451,6 +453,6 @@ ResourceVersion 是 Kubernetes 乐观并发控制的核心机制，在 list & wa
 
 1. **ListerWatcher** — 数据源抽象，封装与 API Server 的 List/Watch 交互
 2. **Reflector** — 核心引擎，通过 list+watch 或 watchList 将数据同步到 DeltaFIFO
-3. **DeltaFIFO** — 变更日志队列，以 Deltas 形式记录每个对象的所有变更，并通过 `knownObjects` 实现删除检测补偿
+3. **DeltaFIFO** — 待处理变更队列，以 Deltas 形式暂存对象在被消费前积累的变更，并通过 `knownObjects` 实现删除检测补偿
 
 至此，数据从 API Server 流入了 DeltaFIFO。下一篇文章将介绍 Informer 和 Indexer，看消费者如何从 DeltaFIFO 中取出数据并构建本地缓存。
