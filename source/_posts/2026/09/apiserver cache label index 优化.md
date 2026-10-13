@@ -1,5 +1,5 @@
 ---
-title: watchCache 内存泄漏问题分析与修复
+title: apiserver cache label index 优化
 date: 2026-09-22 19:45:26
 tags:
   - 技术
