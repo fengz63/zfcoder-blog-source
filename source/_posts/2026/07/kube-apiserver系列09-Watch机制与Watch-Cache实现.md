@@ -9,12 +9,12 @@ categories: [技术]
 
 ## 1. 引言
 
-在 Kubernetes 体系中，**Watch 机制**是控制平面中最核心的通信模式。kubelet、scheduler、controller-manager 等组件都通过 Watch 来实时跟踪资源变化，而不需要轮询 apiserver。
+在 Kubernetes 体系中，**watch 机制**是控制平面中最核心的通信模式。kubelet、scheduler、controller-manager 等组件都通过 watch 来实时跟踪资源变化，而不需要轮询 apiserver。
 
-Watch 机制的实现横跨三个层次：
+watch 机制的实现横跨三个层次：
 
 ```
-Client (reflector/informer)
+Client (reflector/informer)     
     │
     ▼
 [Watch Cache - Cacher]       ← 内存缓存层，服务所有 List/Watch 请求
@@ -26,13 +26,13 @@ Client (reflector/informer)
 [etcd]                       ← 持久化存储
 ```
 
-本文将从最上层的 `watch.Interface` 开始，逐层深入直到 etcd 的 MVCC Watch，完整解析 Watch 机制的实现细节。
+本文将从最上层的 `watch.Interface` 开始，逐层深入直到 etcd 的 MVCC watch，完整解析 watch 机制的实现细节。
 
 <!--more-->
 
-## 2. Watch 核心抽象：watch.Interface
+## 2. watch 核心抽象：watch.Interface
 
-所有 Watch 相关类型定义在 `staging/src/k8s.io/apimachinery/pkg/watch/watch.go`：
+所有 watch 相关类型定义在 `staging/src/k8s.io/apimachinery/pkg/watch/watch.go`：
 
 ```go
 type Interface interface {
@@ -56,13 +56,13 @@ type Event struct {
 }
 ```
 
-这个接口极其简洁——只有 `Stop()` 和 `ResultChan()` 两个方法。任何实现了该接口的类型都可以作为 Watch 事件的消费者。无论底层使用的是 etcd 流、Broadcaster 扇出、还是测试用的 FakeWatcher，对调用方来说 `watch.Interface` 的行为是一致的：
+这个接口极其简洁——只有 `Stop()` 和 `ResultChan()` 两个方法。任何实现了该接口的类型都可以作为 watch 事件的消费者。无论底层使用的是 etcd 流、broadcaster 扇出、还是测试用的 FakeWatcher，对调用方来说 `watch.Interface` 的行为是一致的：
 
 1. 调用 `ResultChan()` 获得一个只读 channel
 2. 从 channel 中读取 `Event`：`ADDED`、`MODIFIED`、`DELETED`、`BOOKMARK`、`ERROR`
 3. 需要停止时调用 `Stop()`，之后 channel 会被关闭
 
-### Broadcaster：通用的扇出（Fan-Out）模式
+### Broadcaster：通用的扇出模式
 
 `staging/src/k8s.io/apimachinery/pkg/watch/mux.go` 中实现了 `Broadcaster`——一个将单个事件源分发到多个 watcher 的通用组件：
 
@@ -266,10 +266,10 @@ func (wc *watchChan) processEvents(resultChanWG *sync.WaitGroup) {
 
 ## 4. Watch Cache：Cacher 架构
 
-Cacher 是 Watch 机制的核心组件，位于 `staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher.go`。它实现了两个关键功能：
+Cacher 是 watch 机制的核心组件，位于 `staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher.go`。它实现了两个关键功能：
 
-1. **缓存所有资源状态**：所有的 LIST 请求从内存中返回，不需要查 etcd
-2. **扇出 Watch 事件**：多个 Watch 请求共享一个底层 etcd Watch
+1. **缓存所有资源状态**：所有的 list 请求从内存中返回，不需要查 etcd
+2. **扇出 Watch 事件**：多个 watch 请求共享一个底层 etcd Watch
 
 ### 整体结构
 
@@ -324,7 +324,28 @@ reflector.ListAndWatch()
                           read event → watchCache.Add/Update/Delete
 ```
 
-即这个 Reflector **不是** client-go 在外面用的那个，而是 apiserver **内部**用来把 etcd 数据灌入 watchCache 的桥梁：`etcd → listerWatcher → Reflector → watchCache`。
+reflector 的启动部分见(cacher.go:472-482)：
+```
+go func() {
+    defer cacher.stopWg.Done()
+    defer cacher.terminateAllWatchers()
+    wait.Until(
+        func() {
+            if !cacher.isStopped() {
+                cacher.startCaching(stopCh)
+            }
+        }, time.Second, stopCh,
+    )
+}()
+```
+
+即这个 Reflector **不是** client-go 在外面用的那个，而是 apiserver **内部**用来把 etcd 数据灌入 watchCache 的桥梁：`etcd → listerWatcher → Reflector → watchCache`
+
+一个问题：**cacher.go 中是什么时候把数据更新到 watchCache 中的呢？**
+
+cacher 和 watchCache 的连接关系是 Reflector 的 `store` 参数：创建时传入的 `watchCache` 实现了 Reflector 所需的 Store 接口。收到 `ADDED`、`MODIFIED`、`DELETED` 事件后，client-go 的 Reflector 分别调用 `store.Add(event.Object)`、`store.Update(event.Object)`、`store.Delete(event.Object)`；这里的 `store` 就是这个 `watchCache`。
+
+换句话说，`watch_cache.go` 并不是被 `cacher.go` 在处理每个事件时直接调用；`cacher.go` 在初始化时把 `watchCache` 交给 Reflector，并把 `cacher.processEvent` 作为 watchCache 的 `eventHandler`。之后 Reflector 通过 Store 接口写缓存，watchCache 再通过回调把事件交回 Cacher 做扇出分发。
 
 ### 4.1 watchCache：环形事件缓冲区
 
@@ -359,23 +380,25 @@ type watchCacheEvent struct {
 }
 ```
 
-**事件写入流程**（`processEvent` 方法被 Reflector 调用）：
+**事件写入流程**：Reflector 本身不会直接调用 `processEvent`。它把收到的事件映射成对 `watchCache` 的 `Add`、`Update` 或 `Delete` 调用；这三个方法构造标准 `watch.Event` 和 store 更新函数，再调用 `processEvent`。例如 `Update()` 中的调用是 `return w.processEvent(event, resourceVersion, f)`。
 
 ```
 Reflector 收到 etcd 事件
     │
-    ├── 1. 计算 key（对象标识）
-    ├── 2. 获取 labels/fields
-    ├── 3. 从 store 中查找旧对象
-    ├── 4. 加锁：
-    │       ├── updateCache() → 追加到环形缓冲区（必要时扩容）
-    │       ├── 更新 resourceVersion
-    │       ├── 更新 store（Add/Update/Delete）
-    │       ├── cond.Broadcast() 唤醒等待者
-    │       └── 记录快照（如果启用了 ListFromCacheSnapshot）
-    ├── 5. 解锁
-    └── 6. eventHandler(wcEvent) → 推送到 c.incoming
+    └── 根据事件类型调用 watchCache.Add/Update/Delete
+          │
+          └── processEvent(event, resourceVersion, updateFunc)
+                ├── 计算 key、labels/fields，并查找旧对象
+                ├── 加锁
+                │     ├── updateCache() → 追加到环形缓冲区（必要时扩容）
+                │     ├── 更新 resourceVersion
+                │     ├── updateFunc(elem) → 更新 store
+                │     ├── 记录快照（如果启用）
+                │     └── cond.Broadcast()，然后解锁
+                └── eventHandler(wcEvent) → 推送到 c.incoming
 ```
+
+`updateCache()` 就是在 `processEvent()` 持有写锁后调用的：源码位置是 `watch_cache.go` 的 `w.updateCache(wcEvent)`。它只负责将事件追加到环形缓冲区（满时先调整容量、必要时淘汰最旧事件）；当前对象索引的 Add/Update/Delete 则由传入的 `updateFunc(elem)` 执行。也就是说，环形事件历史和当前对象 store 是两份不同的数据结构。
 
 **动态容量调整**：
 
@@ -452,7 +475,7 @@ func (c *Cacher) Watch(ctx context.Context, key string, opts storage.ListOptions
     // Step 6: 计算需要的 ResourceVersion
     requiredResourceVersion, _ := c.getWatchCacheResourceVersion(ctx, requestedWatchRV, opts)
 
-    // Step 7: 等待 watchCache 追上 requiredResourceVersion
+    // Step 7: 仅在 sendInitialEvents 请求要求初始状态达到指定版本时等待 cache 追上
     c.waitUntilWatchCacheFreshAndForceAllEvents(ctx, requiredResourceVersion, opts)
 
     // Step 8: 加锁获取 cacheInterval
@@ -479,11 +502,20 @@ func (c *Cacher) Watch(ctx context.Context, key string, opts storage.ListOptions
 
 **关于 ResourceVersion 的语义：**
 
-| ResourceVersion | 行为 |
-|----------------|------|
-| `0` | 从当前最新状态开始，不会阻塞等待 |
-| `> 0` | 返回该版本之后的事件，阻塞直到 cache 赶上该版本（最多 3s） |
-| `""` (未指定) | 返回最新版本之后的事件 |
+下面描述的是普通 Watch（没有设置 `sendInitialEvents`）的行为：
+
+| ResourceVersion | Watch 开始时的行为 | 初始对象从哪里来 / 是否访问底层存储 |
+|----------------|-------------------|--------------------------------------|
+| `0` | 先发送当前状态中匹配的对象，再发送后续变化；初始对象以 `ADDED` 事件出现 | 对象来自 watch cache 当前保存的状态，不会为每个 Watch 请求重新向 etcd 执行全量 List。这里不要求 cache 对齐到某个指定 RV，因此初始状态可能不是最新的 |
+| `> 0` | 从指定 RV **之后**开始发送事件，不发送初始对象快照 | 从 watch cache 的事件历史中读取；普通 Watch 不会等待 cache 追到该 RV。若该 RV 早于 cache 保留的事件范围，会返回过期错误 |
+| `""`（未指定） | 从建立 watch 时的最新位置开始发送后续事件，不发送初始对象快照 | Cacher 会调用底层 storage 的 `GetCurrentResourceVersion` 取得当前 RV；这是获取版本号，不是从 etcd 拉取全量对象 |
+
+注意：
+- 这里的 `0` 是 Kubernetes 为兼容旧 watch 语义保留的特殊情况：源码在 `getAllEventsSinceLocked()` 中发现 `resourceVersion == 0` 且未请求 `sendInitialEvents` 时，会从 watch cache 当前状态构造初始事件。它不是“只从现在开始监听”。
+
+- `> 0` 也不是“阻塞直到 cache 赶上，最多 3 秒”。普通 watch 不需要先等到该版本：它从该 RV 之后的缓存事件开始，之后随 cache 收到新事件继续发送。3 秒等待只发生在要求初始状态满足版本新鲜度的路径，例如设置了 `sendInitialEvents`；若 cache 在时限内未达到目标版本，会返回 `TooLargeResourceVersion`。
+
+- 若设置了 `sendInitialEvents=true`，上述 `RV=0` 的兼容语义不适用：Cacher 会用缓存当前对象作为初始事件，并在初始事件结束时发送 bookmark；该请求按 API 校验要求结合 `resourceVersionMatch=NotOlderThan` 等选项判断需要达到的版本，必要时等待 cache 同步。
 
 ### 4.4 cacheWatcher：每个 Watch 请求一个 goroutine
 
@@ -837,12 +869,13 @@ Legend:
             ▼
  ┌──────────────────────────┐
  │ Layer 4: watchCache      │
- │ processEvent()           │
- │   1. 计算 key, labels    │
- │   2. 查找旧对象           │
- │   3. 追加到环形缓冲区      │
- │   4. 更新 store           │
- │   5. cond.Broadcast()     │
+ │ Add/Update/Delete()      │
+ │   └─ processEvent()      │
+ │       ├─ 计算 key/attrs  │
+ │       ├─ 查找旧对象       │
+ │       ├─ updateCache()   │
+ │       ├─ 更新 store       │
+ │       └─ 唤醒等待者       │
  └──────────┬───────────────┘
             │
             │ eventHandler(wcEvent)
